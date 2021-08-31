@@ -8,6 +8,13 @@
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/kvm_host.h>
+#include <linux/platform_device.h>
+#include <linux/vfio.h>
+#include <uapi/linux/iommufd.h>
+// FIXME should drop them
+#include <linux/iommufd.h>
+#include "../../iommufd/iommufd_private.h"
 
 #include <acpi/acpixf.h>
 
@@ -27,8 +34,10 @@
 #define  CMDQV_EN			BIT(0)
 
 #define TEGRA241_CMDQV_PARAM		0x0004
+#define  CMDQV_NUM_SID_PER_VM_LOG2	GENMASK(15, 12)
 #define  CMDQV_NUM_VINTF_LOG2		GENMASK(11, 8)
 #define  CMDQV_NUM_VCMDQ_LOG2		GENMASK(7, 4)
+#define  CMDQV_VER			GENMASK(3, 0)
 
 #define TEGRA241_CMDQV_STATUS		0x0008
 #define  CMDQV_STATUS			GENMASK(2, 1)
@@ -47,6 +56,12 @@
 /* VINTF config regs */
 #define TEGRA241_VINTF(v)		(0x1000 + 0x100*(v))
 
+#define TEGRA241_VINTFi_CONFIG(i)		(TEGRA241_VINTF(i) + TEGRA241_VINTF_CONFIG)
+#define TEGRA241_VINTFi_STATUS(i)		(TEGRA241_VINTF(i) + TEGRA241_VINTF_STATUS)
+#define TEGRA241_VINTFi_SID_MATCH(i, s)	(TEGRA241_VINTF(i) + TEGRA241_VINTF_SID_MATCH(s))
+#define TEGRA241_VINTFi_SID_REPLACE(i, s)	(TEGRA241_VINTF(i) + TEGRA241_VINTF_SID_REPLACE(s))
+#define TEGRA241_VINTFi_CMDQ_ERR_MAP(i,m)	(TEGRA241_VINTF(i) + TEGRA241_VINTF_CMDQ_ERR_MAP(m))
+
 #define TEGRA241_VINTF_CONFIG		0x0000
 #define  VINTF_HYP_OWN			BIT(17)
 #define  VINTF_VMID			GENMASK(16, 1)
@@ -55,6 +70,10 @@
 #define TEGRA241_VINTF_STATUS		0x0004
 #define  VINTF_STATUS			GENMASK(3, 1)
 #define  VINTF_ENABLED			BIT(0)
+#define  VINTF_VI_NUM_LVCMDQ		GENMASK(23, 16)
+
+#define TEGRA241_VINTF_SID_MATCH(s)	(0x0040 + 0x4*(s))
+#define TEGRA241_VINTF_SID_REPLACE(s)	(0x0080 + 0x4*(s))
 
 #define TEGRA241_VINTF_CMDQ_ERR_MAP(m)	(0x00C0 + 0x4*(m))
 
@@ -210,14 +229,22 @@ struct tegra241_vcmdq {
 };
 
 struct tegra241_vintf {
+	struct iommufd_viommu core;
+
 	u16 idx;
+	u16 vmid;
 	u32 cfg;
 	u32 status;
 
 	void __iomem *base;
 	struct tegra241_cmdqv *cmdqv;
 	struct tegra241_vcmdq **vcmdqs;
+	struct arm_smmu_domain *smmu_domain;
+
+#define TEGRA241_VINTF_NUM_SLOTS 16
+	struct xarray		sids;
 };
+#define viommu_to_vintf(v) container_of(v, struct tegra241_vintf, core)
 
 struct tegra241_cmdqv {
 	struct arm_smmu_device *smmu;
@@ -225,6 +252,7 @@ struct tegra241_cmdqv {
 	struct device *dev;
 	struct resource res;
 	void __iomem *base;
+	resource_size_t ioaddr;
 	int irq;
 
 	/* CMDQV Hardware Params */
@@ -558,6 +586,8 @@ tegra241_cmdqv_find_resource(struct arm_smmu_device *smmu, int id)
 
 	acpi_dev_free_resource_list(&resource_list);
 
+	cmdqv->ioaddr = rentry->res->start;
+
 	INIT_LIST_HEAD(&resource_list);
 
 	ret = acpi_dev_get_resources(adev, &resource_list,
@@ -650,4 +680,237 @@ free_res:
 	devm_kfree(smmu->dev, cmdqv);
 
 	return NULL;
+}
+
+static void tegra241_vintf_deinit_vcmdq(struct tegra241_vcmdq *vcmdq)
+{
+	struct tegra241_vintf *vintf = vcmdq->vintf;
+	struct tegra241_cmdqv *cmdqv = vintf->cmdqv;
+	u32 regval;
+
+	vcmdq_page0_writel(0, CONFIG);
+	if (readl_poll_timeout(vcmdq->page0 + TEGRA241_VCMDQ_STATUS,
+			       regval, regval != VCMDQ_ENABLED,
+			       1, ARM_SMMU_POLL_TIMEOUT_US)) {
+		u32 gerrorn = vcmdq_page0_readl_relaxed(GERRORN);
+		u32 gerror = vcmdq_page0_readl_relaxed(GERROR);
+		u32 cons = vcmdq_page0_readl_relaxed(CONS);
+
+		vcmdq_err("failed to enable\n");
+		vcmdq_err("  GERROR=0x%X\n", gerror);
+		vcmdq_err("  GERRORN=0x%X\n", gerrorn);
+		vcmdq_err("  CONS=0x%X\n", cons);
+	}
+	vcmdq_page0_writel_relaxed(0, PROD);
+	vcmdq_page0_writel_relaxed(0, CONS);
+	vcmdq_page1_writeq_relaxed(0, BASE);
+	vcmdq_page1_writeq_relaxed(0, CONS_INDX_BASE);
+
+	vcmdq_info("cleared\n");
+}
+
+static int tegra241_vintf_init_vcmdq(struct tegra241_vcmdq *vcmdq,
+				     phys_addr_t q_base, u32 log2size)
+{
+	struct tegra241_vintf *vintf = vcmdq->vintf;
+	struct tegra241_cmdqv *cmdqv = vintf->cmdqv;
+	u64 regval64;
+
+	tegra241_vintf_deinit_vcmdq(vcmdq);
+
+	regval64 = (q_base & VCMDQ_ADDR) | FIELD_PREP(VCMDQ_LOG2SIZE, log2size);
+	vcmdq_page1_writeq_relaxed(regval64, BASE);
+
+	vcmdq_info("allocated at host PA 0x%llx size 0x%lx\n",
+		   q_base, 1UL << log2size);
+	return 0;
+}
+
+struct iommufd_viommu *
+tegra241_cmdqv_viommu_alloc(struct tegra241_cmdqv *cmdqv,
+			    struct arm_smmu_domain *smmu_domain)
+{
+	struct tegra241_vintf *vintf;
+	int qidx, idx, ret;
+	u32 regval;
+
+	vintf = iommufd_alloc_viommu(tegra241_vintf, core);
+	if (!vintf)
+		return ERR_PTR(-ENOMEM);
+
+	ret = xa_alloc(&cmdqv->vintfs, &idx, vintf,
+		       XA_LIMIT(1, cmdqv->num_total_vintfs - 1),
+		       GFP_KERNEL_ACCOUNT);
+	if (ret) {
+		dev_err(cmdqv->dev, "failed to allocate vintfs x_array\n");
+		goto out_free;
+	}
+	cmdqv->vintf[idx] = vintf;
+
+	vintf->idx = idx;
+	vintf->cmdqv = cmdqv;
+	vintf->vmid = smmu_domain->vmid;
+	vintf->smmu_domain = smmu_domain;
+	vintf->base = cmdqv->base + TEGRA241_VINTF(idx);
+
+	xa_init_flags(&vintf->sids, XA_FLAGS_ALLOC1 | XA_FLAGS_ACCOUNT);
+
+	regval = FIELD_PREP(VINTF_VMID, vintf->vmid) |
+		 FIELD_PREP(VINTF_EN, 1);
+	writel(regval, vintf->base + TEGRA241_VINTF_CONFIG);
+
+	/* Build an arm_smmu_cmdq for each vcmdq allocated to vintf */
+	vintf->vcmdqs = kcalloc(cmdqv->num_vcmdqs_per_vintf,
+				sizeof(*vintf->vcmdqs), GFP_KERNEL);
+	if (!vintf->vcmdqs) {
+		ret = -ENOMEM;
+		goto out_xa_erase;
+	}
+
+	for (qidx = 0; qidx < cmdqv->num_vcmdqs_per_vintf; qidx++) {
+		u16 vcmdq_idx = cmdqv->num_vcmdqs_per_vintf * vintf->idx + qidx;
+		struct tegra241_vcmdq *vcmdq;
+
+		/* Allocate vcmdqs to vintf */
+		regval  = FIELD_PREP(CMDQV_CMDQ_ALLOC_VINTF, vintf->idx);
+		regval |= FIELD_PREP(CMDQV_CMDQ_ALLOC_LVCMDQ, qidx);
+		regval |= CMDQV_CMDQ_ALLOCATED;
+		cmdqv_writel_relaxed(regval, CMDQ_ALLOC(vcmdq_idx));
+
+		vcmdq = kzalloc(sizeof(*vcmdq), GFP_KERNEL);
+		if (!vcmdq) {
+			ret = -ENOMEM;
+			goto out_free_vcmdq;
+		}
+		vcmdq->vintf = vintf;
+		vcmdq->idx = vcmdq_idx;
+		vcmdq->logical_idx = qidx;
+		vcmdq->page0 = cmdqv->base + TEGRA241_VINTFi_VCMDQ_PAGE0(vintf->idx, qidx);
+		vcmdq->page1 = cmdqv->base + TEGRA241_VINTFi_VCMDQ_PAGE1(vintf->idx, qidx);
+		vintf->vcmdqs[qidx] = vcmdq;
+	}
+
+	vintf_info("allocated with vmid (%d)\n", vintf->vmid);
+
+	return &vintf->core;
+
+out_free_vcmdq:
+	while (qidx--)
+		kfree(vintf->vcmdqs[qidx]);
+	kfree(vintf->vcmdqs);
+out_xa_erase:
+	xa_erase(&cmdqv->vintfs, vintf->idx);
+out_free:
+	kfree(vintf);
+	return ERR_PTR(ret);
+}
+
+int tegra241_cmdqv_viommu_set_data(struct tegra241_cmdqv *cmdqv,
+				   struct iommufd_viommu *viommu,
+				   const struct iommu_user_data *user_data)
+{
+	struct tegra241_vintf *vintf = viommu_to_vintf(viommu);
+	struct arm_smmu_domain *smmu_domain =
+		to_smmu_domain(viommu->hwpt->common.domain);
+	struct iommu_viommu_tegra241_vcmdq arg;
+	phys_addr_t q_base;
+	int ret;
+
+	ret = iommu_copy_struct_from_user(&arg, user_data,
+					  IOMMU_VIOMMU_DATA_TEGRA241_VCMDQ,
+					  cons_idx_base);
+	if (ret)
+		return ret;
+
+	if (!arg.vcmdq_base || arg.vcmdq_base & ~VCMDQ_ADDR)
+		return -EINVAL;
+	if (!arg.vcmdq_log2size || arg.vcmdq_log2size > VCMDQ_LOG2SIZE)
+		return -EINVAL;
+	if (arg.vcmdq_id >= cmdqv->num_vcmdqs_per_vintf)
+		return -EINVAL;
+	q_base = arm_smmu_domain_ipa_to_pa(smmu_domain, arg.vcmdq_base);
+	if (!q_base)
+		return -EINVAL;
+	vintf_info("init logical-VCMDQ%d\n", arg.vcmdq_id);
+	return tegra241_vintf_init_vcmdq(
+		vintf->vcmdqs[arg.vcmdq_id], q_base, arg.vcmdq_log2size);
+}
+
+int tegra241_cmdqv_viommu_reset(struct tegra241_cmdqv *cmdqv,
+				struct iommufd_viommu *viommu)
+{
+	struct tegra241_vintf *vintf = viommu_to_vintf(viommu);
+	int qidx;
+
+	/* Disable LVCMDQs of the VINTF0; clear their PROD and CONS indexes too */
+	for (qidx = 0; qidx < cmdqv->num_vcmdqs_per_vintf; qidx++)
+		tegra241_vintf_deinit_vcmdq(vintf->vcmdqs[qidx]);
+	return 0;
+}
+
+void tegra241_cmdqv_viommu_free(struct tegra241_cmdqv *cmdqv,
+				struct iommufd_viommu *viommu)
+{
+	struct tegra241_vintf *vintf = viommu_to_vintf(viommu);
+	int qidx;
+
+	/* Disable LVCMDQs of the VINTF0; clear their PROD and CONS indexes too */
+	for (qidx = 0; qidx < cmdqv->num_vcmdqs_per_vintf; qidx++)
+		tegra241_vintf_deinit_vcmdq(vintf->vcmdqs[qidx]);
+
+	/* Disable and cleanup VINTF configurations */
+	vintf_writel_relaxed(0, CONFIG);
+
+	xa_erase(&cmdqv->vintfs, vintf->idx);
+	/* IOMMUFD core frees viommu, i.e. vintf */
+	cmdqv->vintf[vintf->idx] = NULL;
+	vintf_info("deallocated with vmid (%d)\n", vintf->vmid);
+}
+
+int tegra241_cmdqv_viommu_set_dev_id(struct iommufd_viommu *viommu,
+				     struct arm_smmu_master *master,
+				     u64 dev_id)
+{
+	struct tegra241_vintf *vintf =
+		container_of(viommu, struct tegra241_vintf, core);
+	struct arm_smmu_stream *stream = &master->streams[0];
+	int slot, ret;
+
+	WARN_ON(master->num_streams != 1);
+
+	/* Find an empty slot of SID_MATCH and SID_REPLACE */
+	ret = xa_alloc(&vintf->sids, &slot, stream,
+		       XA_LIMIT(0, TEGRA241_VINTF_NUM_SLOTS - 1),
+		       GFP_KERNEL_ACCOUNT);
+	if (ret)
+		return ret;
+
+	vintf_writel_relaxed(stream->id, SID_REPLACE(slot));
+	vintf_writel_relaxed(dev_id << 1 | 0x1, SID_MATCH(slot));
+	stream->cmdqv_sid_slot = slot;
+
+	return 0;
+}
+
+void tegra241_cmdqv_viommu_unset_dev_id(struct iommufd_viommu *viommu,
+					struct arm_smmu_master *master)
+{
+	struct tegra241_vintf *vintf =
+		container_of(viommu, struct tegra241_vintf, core);
+	struct arm_smmu_stream *stream = &master->streams[0];
+	int slot = stream->cmdqv_sid_slot;
+
+	vintf_writel_relaxed(0, SID_REPLACE(slot));
+	vintf_writel_relaxed(0, SID_MATCH(slot));
+	WARN_ON(stream != xa_erase(&vintf->sids, slot));
+}
+
+unsigned long tegra241_cmdqv_get_mmap_pfn(struct tegra241_cmdqv *cmdqv,
+					  struct iommufd_viommu *viommu,
+					  size_t pgsize)
+{
+	struct tegra241_vintf *vintf =
+		container_of(viommu, struct tegra241_vintf, core);
+
+	return (cmdqv->ioaddr + TEGRA241_VINTFi_PAGE0(vintf->idx)) >> PAGE_SHIFT;
 }
