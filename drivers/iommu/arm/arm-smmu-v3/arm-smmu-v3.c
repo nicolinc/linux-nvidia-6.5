@@ -30,6 +30,7 @@
 
 #include "arm-smmu-v3.h"
 #include "../../dma-iommu.h"
+#include "../../iommufd/iommufd_private.h"
 
 static bool disable_bypass = true;
 module_param(disable_bypass, bool, 0444);
@@ -3801,6 +3802,96 @@ static int arm_smmu_def_domain_type(struct device *dev)
 	return 0;
 }
 
+static struct iommufd_viommu *arm_smmu_viommu_alloc(struct device *dev,
+						    struct iommu_domain *domain)
+{
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain_devices(domain);
+	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
+
+	if (!master || !master->smmu)
+		return ERR_PTR(-ENODEV);
+
+	if (!smmu_domain || smmu_domain->stage != ARM_SMMU_DOMAIN_S2)
+		return ERR_PTR(-EINVAL);
+
+	if (master->smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_viommu_alloc(
+			master->smmu->tegra241_cmdqv, smmu_domain);
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static int arm_smmu_viommu_set_data(struct iommufd_viommu *viommu,
+				    const struct iommu_user_data *user_data)
+{
+	struct arm_smmu_device *smmu =
+		container_of(viommu->iommu_dev, struct arm_smmu_device, iommu);
+	if (smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_viommu_set_data(
+			smmu->tegra241_cmdqv, viommu, user_data);
+	return -EOPNOTSUPP;
+}
+
+static int arm_smmu_viommu_reset(struct iommufd_viommu *viommu)
+{
+	struct arm_smmu_device *smmu =
+		container_of(viommu->iommu_dev, struct arm_smmu_device, iommu);
+	if (smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_viommu_reset(
+			smmu->tegra241_cmdqv, viommu);
+	return -EOPNOTSUPP;
+}
+
+static void arm_smmu_viommu_free(struct iommufd_viommu *viommu)
+{
+	struct arm_smmu_device *smmu =
+		container_of(viommu->iommu_dev, struct arm_smmu_device, iommu);
+	if (smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_viommu_free(
+			smmu->tegra241_cmdqv, viommu);
+}
+
+static int arm_smmu_viommu_set_dev_id(struct iommufd_viommu *viommu,
+				      struct device *dev, u64 dev_id)
+{
+	struct arm_smmu_device *smmu =
+		container_of(viommu->iommu_dev, struct arm_smmu_device, iommu);
+	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
+
+	if (!master || !master->smmu)
+		return -ENODEV;
+	if (master->smmu != smmu)
+		return -EINVAL;
+	if (smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_viommu_set_dev_id(viommu, master, dev_id);
+	return -EOPNOTSUPP;
+}
+
+static void arm_smmu_viommu_unset_dev_id(struct iommufd_viommu *viommu,
+					 struct device *dev)
+{
+	struct arm_smmu_device *smmu =
+		container_of(viommu->iommu_dev, struct arm_smmu_device, iommu);
+	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
+
+	if (!master || !master->smmu || master->smmu != smmu)
+		return;
+	if (smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_viommu_unset_dev_id(viommu, master);
+}
+
+static unsigned long arm_smmu_viommu_get_mmap_pfn(struct iommufd_viommu *viommu,
+						  size_t pgsize)
+{
+	struct arm_smmu_device *smmu =
+		container_of(viommu->iommu_dev, struct arm_smmu_device, iommu);
+
+	if (smmu && smmu->tegra241_cmdqv)
+		return tegra241_cmdqv_get_mmap_pfn(smmu->tegra241_cmdqv,
+						   viommu, pgsize);
+
+	return 0;
+}
+
 static struct iommu_ops arm_smmu_ops = {
 	.identity_domain	= &arm_smmu_identity_domain,
 	.blocked_domain		= &arm_smmu_blocked_domain,
@@ -3818,6 +3909,13 @@ static struct iommu_ops arm_smmu_ops = {
 	.dev_enable_feat	= arm_smmu_dev_enable_feature,
 	.dev_disable_feat	= arm_smmu_dev_disable_feature,
 	.dev_invalidate_user    = arm_smmu_dev_invalidate_user,
+	.viommu_alloc		= arm_smmu_viommu_alloc,
+	.viommu_set_data	= arm_smmu_viommu_set_data,
+	.viommu_reset		= arm_smmu_viommu_reset,
+	.viommu_free		= arm_smmu_viommu_free,
+	.viommu_set_dev_id	= arm_smmu_viommu_set_dev_id,
+	.viommu_unset_dev_id	= arm_smmu_viommu_unset_dev_id,
+	.viommu_get_mmap_pfn	= arm_smmu_viommu_get_mmap_pfn,
 	.page_response		= arm_smmu_page_response,
 	.def_domain_type	= arm_smmu_def_domain_type,
 	.pgsize_bitmap		= -1UL, /* Restricted during device attach */
