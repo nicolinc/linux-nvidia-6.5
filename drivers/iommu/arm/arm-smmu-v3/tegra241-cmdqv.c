@@ -8,7 +8,9 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
+#include <linux/iommufd.h>
 #include <linux/iopoll.h>
+#include <uapi/linux/iommufd.h>
 
 #include <acpi/acpixf.h>
 
@@ -28,6 +30,7 @@
 #define  CMDQV_EN			BIT(0)
 
 #define TEGRA241_CMDQV_PARAM		0x0004
+#define  CMDQV_NUM_SID_PER_VM_LOG2	GENMASK(15, 12)
 #define  CMDQV_NUM_VINTF_LOG2		GENMASK(11, 8)
 #define  CMDQV_NUM_VCMDQ_LOG2		GENMASK(7, 4)
 
@@ -55,6 +58,9 @@
 #define TEGRA241_VINTF_STATUS		0x0004
 #define  VINTF_STATUS			GENMASK(3, 1)
 #define  VINTF_ENABLED			BIT(0)
+
+#define TEGRA241_VINTF_SID_MATCH(s)	(0x0040 + 0x4*(s))
+#define TEGRA241_VINTF_SID_REPLACE(s)	(0x0080 + 0x4*(s))
 
 #define TEGRA241_VINTF_LVCMDQ_ERR_MAP_64(m) \
 					(0x00C0 + 0x8*(m))
@@ -154,6 +160,7 @@ MODULE_PARM_DESC(bypass_vcmdq,
 
 /**
  * struct tegra241_vcmdq - Virtual Command Queue
+ * @core: Embedded iommufd_vqueue structure
  * @idx: Global index in the CMDQV HW
  * @lidx: Local index in the VINTF
  * @enabled: Enable status
@@ -164,6 +171,8 @@ MODULE_PARM_DESC(bypass_vcmdq,
  * @page1: MMIO Page1 base address
  */
 struct tegra241_vcmdq {
+	struct iommufd_vqueue core;
+
 	u16 idx;
 	u16 lidx;
 
@@ -176,18 +185,26 @@ struct tegra241_vcmdq {
 	void __iomem *page0;
 	void __iomem *page1;
 };
+#define vqueue_to_vcmdq(v) container_of(v, struct tegra241_vcmdq, core)
 
 /**
  * struct tegra241_vintf - Virtual Interface
+ * @core: Embedded iommufd_viommu structure
  * @idx: Global index in the CMDQV HW
+ * @vmid: VMID for configuration
  * @enabled: Enable status
  * @hyp_own: Owned by hypervisor (in-kernel)
  * @cmdqv: CMDQV HW pointer
  * @vcmdqs: List of VCMDQ pointers
  * @base: MMIO base address
+ * @s2_domain: Stage-2 SMMU domain
+ * @sid_slots: Stream ID Slot allocator
  */
 struct tegra241_vintf {
+	struct iommufd_viommu core;
+
 	u16 idx;
+	u16 vmid;
 
 	bool enabled;
 	bool hyp_own;
@@ -196,16 +213,22 @@ struct tegra241_vintf {
 	struct tegra241_vcmdq **vcmdqs;
 
 	void __iomem *base;
+	struct arm_smmu_domain *s2_domain;
+
+	struct ida sid_slots;
 };
+#define viommu_to_vintf(v) container_of(v, struct tegra241_vintf, core)
 
 /**
  * struct tegra241_cmdqv - CMDQ-V for SMMUv3
  * @smmu: SMMUv3 pointer
  * @base: MMIO base address
+ * @base_phys: Page frame number of @base, for mmap
  * @irq: IRQ number
  * @num_vintfs: Total number of VINTFs
  * @num_vcmdqs: Total number of VCMDQs
  * @num_vcmdqs_per_vintf: Number of preallocated VCMDQs per VINTF
+ * @num_sids_per_vintf: Total number of SID replacements per VINTF
  * @vintf_ids: VINTF id allocator
  * @vtinfs: List of VINTFs
  */
@@ -213,12 +236,14 @@ struct tegra241_cmdqv {
 	struct arm_smmu_device *smmu;
 
 	void __iomem *base;
+	unsigned long base_pfn;
 	int irq;
 
 	/* CMDQV Hardware Params */
 	u16 num_vintfs;
 	u16 num_vcmdqs;
 	u16 num_vcmdqs_per_vintf;
+	u16 num_sids_per_vintf;
 
 	struct ida vintf_ids;
 
@@ -410,6 +435,11 @@ static void tegra241_vcmdq_hw_deinit(struct tegra241_vcmdq *vcmdq)
 		"%sdeinited\n", lvcmdq_error_header(vcmdq));
 }
 
+static void _tegra241_vcmdq_hw_init(struct tegra241_vcmdq *vcmdq)
+{
+	vcmdq_page1_writeq_relaxed(vcmdq, vcmdq->cmdq.q.q_base, BASE);
+}
+
 static int tegra241_vcmdq_hw_init(struct tegra241_vcmdq *vcmdq)
 {
 	int ret;
@@ -418,8 +448,7 @@ static int tegra241_vcmdq_hw_init(struct tegra241_vcmdq *vcmdq)
 	tegra241_vcmdq_hw_deinit(vcmdq);
 
 	/* Configure and enable VCMDQ */
-	vcmdq_page1_writeq_relaxed(vcmdq, vcmdq->cmdq.q.q_base, BASE);
-
+	_tegra241_vcmdq_hw_init(vcmdq);
 	ret = vcmdq_write_config(vcmdq, VCMDQ_EN);
 	if (ret) {
 		dev_err(vcmdq->cmdqv->smmu->dev,
@@ -439,11 +468,16 @@ static int tegra241_vcmdq_hw_init(struct tegra241_vcmdq *vcmdq)
 static void tegra241_vintf_hw_deinit(struct tegra241_vintf *vintf)
 {
 	u16 lidx;
+	int slot;
 
 	for (lidx = 0; lidx < vintf->cmdqv->num_vcmdqs_per_vintf; lidx++)
 		if (vintf->vcmdqs && vintf->vcmdqs[lidx])
 			tegra241_vcmdq_hw_deinit(vintf->vcmdqs[lidx]);
 	vintf_write_config(vintf, 0);
+	for (slot = 0; slot < vintf->cmdqv->num_sids_per_vintf; slot++) {
+		vintf_writel_relaxed(vintf, 0, SID_REPLACE(slot));
+		vintf_writel_relaxed(vintf, 0, SID_MATCH(slot));
+	}
 }
 
 static int tegra241_vintf_hw_init(struct tegra241_vintf *vintf, bool hyp_own)
@@ -461,7 +495,8 @@ static int tegra241_vintf_hw_init(struct tegra241_vintf *vintf, bool hyp_own)
 	 * whether enabling it here or not, as !HYP_OWN cmdq HWs only support a
 	 * restricted set of supported commands.
 	 */
-	regval = FIELD_PREP(VINTF_HYP_OWN, hyp_own);
+	regval = FIELD_PREP(VINTF_HYP_OWN, hyp_own) |
+		 FIELD_PREP(VINTF_VMID, vintf->vmid);
 	vintf_writel(vintf, regval, CONFIG);
 
 	ret = vintf_write_config(vintf, regval | VINTF_EN);
@@ -590,6 +625,8 @@ tegra241_cmdqv_find_resource(struct arm_smmu_device *smmu,
 
 	acpi_dev_free_resource_list(&resource_list);
 
+	cmdqv->base_pfn = rentry->res->start >> PAGE_SHIFT;
+
 	INIT_LIST_HEAD(&resource_list);
 
 	ret = acpi_dev_get_resources(adev, &resource_list,
@@ -709,7 +746,9 @@ static void tegra241_vintf_free_lvcmdq(struct tegra241_vcmdq *vcmdq)
 
 	dev_dbg(vcmdq->cmdqv->smmu->dev,
 		"%sdeallocated\n", lvcmdq_error_header(vcmdq));
-	kfree(vcmdq);
+	/* Guest-owned VCMDQ is free-ed with vqueue by iommufd core */
+	if (vcmdq->vintf->hyp_own)
+		kfree(vcmdq);
 }
 
 static int tegra241_cmdqv_init_vintf(struct tegra241_cmdqv *cmdqv, u16 max_idx,
@@ -771,6 +810,8 @@ static int tegra241_cmdqv_probe(struct tegra241_cmdqv *cmdqv)
 	cmdqv->num_vintfs = 1 << FIELD_GET(CMDQV_NUM_VINTF_LOG2, regval);
 	cmdqv->num_vcmdqs = 1 << FIELD_GET(CMDQV_NUM_VCMDQ_LOG2, regval);
 	cmdqv->num_vcmdqs_per_vintf = cmdqv->num_vcmdqs / cmdqv->num_vintfs;
+	cmdqv->num_sids_per_vintf =
+		1 << FIELD_GET(CMDQV_NUM_SID_PER_VM_LOG2, regval);
 
 	cmdqv->vintfs = kcalloc(cmdqv->num_vintfs,
 				sizeof(*cmdqv->vintfs), GFP_KERNEL);
@@ -871,8 +912,11 @@ static void tegra241_cmdqv_remove_vintf(struct tegra241_cmdqv *cmdqv, u16 idx)
 	cmdqv->vintfs[idx] = NULL;
 
 	dev_dbg(cmdqv->smmu->dev, "VINTF%u: deallocated\n", vintf->idx);
+	ida_destroy(&vintf->sid_slots);
 	kfree(vintf->vcmdqs);
-	kfree(vintf);
+	/* Guest-owned VINTF is free-ed with viommu by iommufd core */
+	if (vintf->hyp_own)
+		kfree(vintf);
 }
 
 void tegra241_cmdqv_device_remove(struct arm_smmu_device *smmu)
@@ -898,4 +942,214 @@ void tegra241_cmdqv_device_remove(struct arm_smmu_device *smmu)
 	iounmap(cmdqv->base);
 	kfree(cmdqv->vintfs);
 	kfree(cmdqv);
+}
+
+/* User-space VIOMMU and VQUEUE Functions */
+
+static int tegra241_vcmdq_hw_init_user(struct tegra241_vcmdq *vcmdq)
+{
+	/* Configure the vcmdq only; User space does the enabling */
+	_tegra241_vcmdq_hw_init(vcmdq);
+
+	dev_dbg(vcmdq->cmdqv->smmu->dev,
+		"%sinited at host PA 0x%llx size 0x%lx\n",
+		lvcmdq_error_header(vcmdq),
+		vcmdq->cmdq.q.q_base & VCMDQ_ADDR,
+		1UL << (vcmdq->cmdq.q.q_base & VCMDQ_LOG2SIZE));
+	return 0;
+}
+
+static struct iommufd_vqueue *
+tegra241_cmdqv_vqueue_alloc(struct iommufd_viommu *viommu,
+			    const struct iommu_user_data *user_data)
+{
+	struct tegra241_vintf *vintf = viommu_to_vintf(viommu);
+	struct tegra241_cmdqv *cmdqv = vintf->cmdqv;
+	struct iommu_vqueue_tegra241_cmdqv arg;
+	struct tegra241_vcmdq *vcmdq;
+	phys_addr_t q_base;
+	int ret;
+
+	ret = iommu_copy_struct_from_user(&arg, user_data,
+					  IOMMU_VQUEUE_DATA_TEGRA241_CMDQV,
+					  vcmdq_base);
+	if (ret)
+		return ERR_PTR(ret);
+
+	if (!arg.vcmdq_base || arg.vcmdq_base & ~VCMDQ_ADDR)
+		return ERR_PTR(-EINVAL);
+	if (!arg.vcmdq_log2size || arg.vcmdq_log2size > VCMDQ_LOG2SIZE)
+		return ERR_PTR(-EINVAL);
+	if (arg.vcmdq_id >= cmdqv->num_vcmdqs_per_vintf)
+		return ERR_PTR(-EINVAL);
+	q_base = arm_smmu_domain_ipa_to_pa(vintf->s2_domain, arg.vcmdq_base);
+	if (!q_base)
+		return ERR_PTR(-EINVAL);
+
+	if (vintf->vcmdqs[arg.vcmdq_id]) {
+		vcmdq = vintf->vcmdqs[arg.vcmdq_id];
+
+		/* deinit the previous setting as a reset, before re-init */
+		tegra241_vcmdq_hw_deinit(vcmdq);
+
+		vcmdq->cmdq.q.q_base  = q_base & VCMDQ_ADDR;
+		vcmdq->cmdq.q.q_base |=	arg.vcmdq_log2size;
+		tegra241_vcmdq_hw_init_user(vcmdq);
+
+		return &vcmdq->core;
+	}
+
+	vcmdq = iommufd_vqueue_alloc(tegra241_vcmdq, core);
+	if (!vcmdq)
+		return ERR_PTR(-ENOMEM);
+
+	ret = tegra241_vintf_init_lvcmdq(vintf, arg.vcmdq_id, vcmdq);
+	if (ret)
+		goto free_vcmdq;
+	dev_dbg(cmdqv->smmu->dev, "%sallocated\n", lvcmdq_error_header(vcmdq));
+
+	vcmdq->cmdq.q.q_base  = q_base & VCMDQ_ADDR;
+	vcmdq->cmdq.q.q_base |=	arg.vcmdq_log2size;
+
+	ret = tegra241_vcmdq_hw_init_user(vcmdq);
+	if (ret)
+		goto free_vcmdq;
+	vintf->vcmdqs[arg.vcmdq_id] = vcmdq;
+
+	return &vcmdq->core;
+free_vcmdq:
+	kfree(vcmdq);
+	return ERR_PTR(ret);
+}
+
+static void tegra241_cmdqv_vqueue_free(struct iommufd_vqueue *vqueue)
+{
+	struct tegra241_vcmdq *vcmdq = vqueue_to_vcmdq(vqueue);
+
+	tegra241_vintf_remove_lvcmdq(vcmdq->vintf, vcmdq->lidx);
+
+	/* IOMMUFD core frees the memory of vcmdq and vqueue */
+}
+
+static void tegra241_cmdqv_viommu_free(struct iommufd_viommu *viommu)
+{
+	struct tegra241_vintf *vintf = viommu_to_vintf(viommu);
+
+	tegra241_cmdqv_remove_vintf(vintf->cmdqv, vintf->idx);
+
+	/* IOMMUFD core frees the memory of vintf and viommu */
+}
+
+static int tegra241_cmdqv_viommu_set_dev_id(struct iommufd_viommu *viommu,
+					    struct device *dev, u64 dev_id)
+{
+	struct tegra241_vintf *vintf =
+		container_of(viommu, struct tegra241_vintf, core);
+	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
+	struct arm_smmu_stream *stream = &master->streams[0];
+	int slot;
+
+	WARN_ON_ONCE(master->num_streams != 1);
+
+	/* Find an empty slot of SID_MATCH and SID_REPLACE */
+	slot = ida_alloc_max(&vintf->sid_slots,
+			     vintf->cmdqv->num_sids_per_vintf - 1, GFP_KERNEL);
+	if (slot < 0)
+		return slot;
+
+	vintf_writel_relaxed(vintf, stream->id, SID_REPLACE(slot));
+	vintf_writel_relaxed(vintf, dev_id << 1 | 0x1, SID_MATCH(slot));
+	stream->cmdqv_sid_slot = slot;
+	dev_dbg(vintf->cmdqv->smmu->dev,
+		"VINTF%u: allocated a slot (%d) for pSID=%x, vSID=%x\n",
+		vintf->idx, slot, stream->id, (u32)dev_id);
+
+	return 0;
+}
+
+static void tegra241_cmdqv_viommu_unset_dev_id(struct iommufd_viommu *viommu,
+					       struct device *dev)
+{
+	struct tegra241_vintf *vintf =
+		container_of(viommu, struct tegra241_vintf, core);
+	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
+	struct arm_smmu_stream *stream = &master->streams[0];
+	int slot = stream->cmdqv_sid_slot;
+
+	vintf_writel_relaxed(vintf, 0, SID_REPLACE(slot));
+	vintf_writel_relaxed(vintf, 0, SID_MATCH(slot));
+	ida_free(&vintf->sid_slots, slot);
+	dev_dbg(vintf->cmdqv->smmu->dev,
+		"VINTF%u: deallocated a slot (%d) for pSID=%x\n",
+		vintf->idx, slot, stream->id);
+}
+
+static unsigned long tegra241_cmdqv_get_mmap_pfn(struct iommufd_viommu *viommu,
+						 size_t pgsize)
+{
+	struct tegra241_vintf *vintf =
+		container_of(viommu, struct tegra241_vintf, core);
+	struct tegra241_cmdqv *cmdqv = vintf->cmdqv;
+
+	return cmdqv->base_pfn + TEGRA241_VINTFi_PAGE0(vintf->idx) / PAGE_SIZE;
+}
+
+static const struct iommufd_viommu_ops tegra241_cmdqv_viommu_ops = {
+	.free = tegra241_cmdqv_viommu_free,
+	.set_dev_id = tegra241_cmdqv_viommu_set_dev_id,
+	.unset_dev_id = tegra241_cmdqv_viommu_unset_dev_id,
+	.vqueue_alloc = tegra241_cmdqv_vqueue_alloc,
+	.vqueue_free = tegra241_cmdqv_vqueue_free,
+	.get_mmap_pfn = tegra241_cmdqv_get_mmap_pfn,
+};
+
+struct iommufd_viommu *
+tegra241_cmdqv_viommu_alloc(struct tegra241_cmdqv *cmdqv,
+			    struct arm_smmu_domain *smmu_domain)
+{
+	struct tegra241_vintf *vintf;
+	int ret;
+
+	if (!smmu_domain || smmu_domain->stage != ARM_SMMU_DOMAIN_S2)
+		return ERR_PTR(-EINVAL);
+
+	vintf = iommufd_viommu_alloc(tegra241_vintf, core);
+	if (!vintf)
+		return ERR_PTR(-ENOMEM);
+	vintf->core.ops = &tegra241_cmdqv_viommu_ops;
+
+	ret = tegra241_cmdqv_init_vintf(cmdqv, cmdqv->num_vintfs - 1, vintf);
+	if (ret < 0) {
+		dev_err(cmdqv->smmu->dev, "no more available vintf\n");
+		goto free_vintf;
+	}
+
+	vintf->s2_domain = smmu_domain;
+	vintf->vmid = smmu_domain->vmid;
+
+	ret = tegra241_vintf_hw_init(vintf, false);
+	if (ret)
+		goto deinit_vintf;
+
+	vintf->vcmdqs = kcalloc(cmdqv->num_vcmdqs_per_vintf,
+				sizeof(*vintf->vcmdqs), GFP_KERNEL);
+	if (!vintf->vcmdqs) {
+		ret = -ENOMEM;
+		goto hw_deinit_vintf;
+	}
+
+	ida_init(&vintf->sid_slots);
+
+	dev_dbg(cmdqv->smmu->dev, "VINTF%u: allocated with vmid (%d)\n",
+		vintf->idx, vintf->vmid);
+
+	return &vintf->core;
+
+hw_deinit_vintf:
+	tegra241_vintf_hw_deinit(vintf);
+deinit_vintf:
+	tegra241_cmdqv_deinit_vintf(cmdqv, vintf->idx);
+free_vintf:
+	kfree(vintf);
+	return ERR_PTR(ret);
 }
