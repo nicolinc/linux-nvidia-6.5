@@ -323,7 +323,8 @@ static int tegra241_cmdqv_init_one_vcmdq(struct tegra241_vcmdq *vcmdq)
 	return arm_smmu_cmdq_init(cmdqv->smmu, cmdq);
 }
 
-struct arm_smmu_cmdq *tegra241_cmdqv_get_cmdq(struct arm_smmu_device *smmu)
+struct arm_smmu_cmdq *tegra241_cmdqv_get_cmdq(struct arm_smmu_device *smmu, u64 *cmds, int n)
+
 {
 	struct tegra241_cmdqv *cmdqv = smmu->tegra241_cmdqv;
 	struct tegra241_vintf *vintf = cmdqv->vintf[0];
@@ -336,6 +337,24 @@ struct arm_smmu_cmdq *tegra241_cmdqv_get_cmdq(struct arm_smmu_device *smmu)
 	/* Use SMMU CMDQ if vintf[0] has error status */
 	if (FIELD_GET(VINTF_STATUS, vintf->status))
 		return &smmu->cmdq;
+
+	/* Check for supported CMDs if VINTF is owned by guest (not hypervisor) */
+	if (!FIELD_GET(VINTF_HYP_OWN, vintf->cfg)) {
+		u64 opcode = (n) ? FIELD_GET(CMDQ_0_OP, cmds[0]) : CMDQ_OP_CMD_SYNC;
+
+		/* List all supported CMDs for vintf->cmdq pathway */
+		switch (opcode) {
+		case CMDQ_OP_TLBI_NH_ASID:
+		case CMDQ_OP_TLBI_NH_VA:
+		case CMDQ_OP_TLBI_S12_VMALL:
+		case CMDQ_OP_TLBI_S2_IPA:
+		case CMDQ_OP_ATC_INV:
+			break;
+		default:
+			/* Unsupported CMDs go for smmu->cmdq pathway */
+			return &smmu->cmdq;
+		}
+	}
 
 	/*
 	 * Select a vcmdq to use. Here we use a temporal solution to
@@ -396,13 +415,22 @@ int tegra241_cmdqv_device_reset(struct arm_smmu_device *smmu)
 	vintf->cmdqv = cmdqv;
 	vintf->base = cmdqv->base + TEGRA241_VINTF(0);
 
+	/*
+	 * Note that HYP_OWN bit is wired to zero when running in guest kernel
+	 * regardless of enabling it here, as !HYP_OWN cmdqs have a restricted
+	 * set of supported commands, by following the HW design.
+	 */
 	regval = FIELD_PREP(VINTF_HYP_OWN, 1);
 	vintf_writel(regval, CONFIG);
 
 	regval |= FIELD_PREP(VINTF_EN, 1);
 	vintf_writel(regval, CONFIG);
 
-	vintf->cfg = regval;
+	/*
+	 * As being mentioned above, HYP_OWN bit is wired to zero for a guest
+	 * kernel, so read back regval from HW to ensure that reflects in cfg
+	 */
+	vintf->cfg = vintf_readl(CONFIG);
 
 	ret = readl_relaxed_poll_timeout(vintf->base + TEGRA241_VINTF_STATUS,
 					 regval, regval & VINTF_ENABLED,
