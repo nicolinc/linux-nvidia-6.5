@@ -500,6 +500,8 @@ struct iommu_ops {
 				 struct device *dev, u64 dev_id);
 	void (*viommu_unset_dev_id)(struct iommufd_viommu *viommu,
 				    struct device *dev);
+	unsigned long (*viommu_get_mmap_pfn)(struct iommufd_viommu *viommu,
+					     size_t pgsize);
 
 	/* Per device IOMMU features */
 	int (*dev_enable_feat)(struct device *dev, enum iommu_dev_features f);
