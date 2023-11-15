@@ -1329,6 +1329,15 @@ static bool kvm_vma_mte_allowed(struct vm_area_struct *vma)
 	return vma->vm_flags & VM_MTE_ALLOWED;
 }
 
+/*
+ * Determine the memory region cacheability from VMA's pgprot. This
+ * is used to set the stage 2 PTEs.
+ */
+static unsigned long mapping_type(pgprot_t page_prot)
+{
+	return FIELD_GET(PTE_ATTRINDX_MASK, pgprot_val(page_prot));
+}
+
 static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 			  struct kvm_memory_slot *memslot, unsigned long hva,
 			  unsigned long fault_status)
@@ -1428,6 +1437,18 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	gfn = fault_ipa >> PAGE_SHIFT;
 	mte_allowed = kvm_vma_mte_allowed(vma);
 
+	/*
+	 * Figure out the memory type based on the user va mapping properties
+	 * Only MT_DEVICE_nGnRE and MT_DEVICE_nGnRnE will be set using
+	 * pgprot_device() and pgprot_noncached() respectively.
+	 */
+	if ((mapping_type(vma->vm_page_prot) == MT_DEVICE_nGnRE) ||
+	    (mapping_type(vma->vm_page_prot) == MT_DEVICE_nGnRnE) ||
+	    (mapping_type(vma->vm_page_prot) == MT_NORMAL_NC))
+		prot |= KVM_PGTABLE_PROT_DEVICE;
+	else if (cpus_have_const_cap(ARM64_HAS_CACHE_DIC))
+		prot |= KVM_PGTABLE_PROT_X;
+
 	/* Don't use the VMA after the unlock -- it may have vanished */
 	vma = NULL;
 
@@ -1514,10 +1535,14 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	if (exec_fault)
 		prot |= KVM_PGTABLE_PROT_X;
 
-	if (device)
+	/*
+	 * When FWB is unsupported, hypervisor starts managing the caching for
+	 * Normal memory using the corresponding KVA. Since the mapped memory
+	 * do not have KVA, override the NORMAL with DEVICE to avoid caching
+	 * management.
+	 */
+	if (!stage2_has_fwb(pgt) && device)
 		prot |= KVM_PGTABLE_PROT_DEVICE;
-	else if (cpus_have_const_cap(ARM64_HAS_CACHE_DIC))
-		prot |= KVM_PGTABLE_PROT_X;
 
 	/*
 	 * Under the premise of getting a FSC_PERM fault, we just need to relax
