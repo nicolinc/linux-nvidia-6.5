@@ -28,4 +28,6 @@ void iommu_device_unregister_bus(struct iommu_device *iommu,
 				 const struct bus_type *bus,
 				 struct notifier_block *nb);
 
+struct iommu_device *iommu_device_get_from_id(u32 iommu_id);
+
 #endif /* __LINUX_IOMMU_PRIV_H */
