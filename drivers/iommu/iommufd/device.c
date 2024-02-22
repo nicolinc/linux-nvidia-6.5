@@ -1419,6 +1419,38 @@ out_put_idev:
 	return rc;
 }
 
+int iommufd_viommu_set_data(struct iommufd_ucmd *ucmd)
+{
+	struct iommu_viommu_set_data *cmd = ucmd->cmd;
+	const struct iommu_user_data user_data = {
+		.type = cmd->data_type,
+		.uptr = u64_to_user_ptr(cmd->data_uptr),
+		.len = cmd->data_len,
+	};
+	struct iommufd_viommu *viommu;
+	int rc;
+
+	if (cmd->flags)
+		return -EOPNOTSUPP;
+	if (!cmd->data_len)
+		return -EINVAL;
+
+	viommu = iommufd_get_viommu(ucmd, cmd->viommu_id);
+	if (IS_ERR(viommu))
+		return PTR_ERR(viommu);
+
+	if (!viommu->iommu_dev->ops->viommu_set_data) {
+		rc = -EOPNOTSUPP;
+		goto out_put_viommu;
+	}
+
+	rc = viommu->iommu_dev->ops->viommu_set_data(
+		viommu, user_data.len ? &user_data : NULL);
+out_put_viommu:
+	iommufd_put_object(ucmd->ictx, &viommu->obj);
+	return rc;
+}
+
 int iommufd_device_set_virtual_id(struct iommufd_ucmd *ucmd)
 {
 	struct iommu_dev_set_virtual_id *cmd = ucmd->cmd;

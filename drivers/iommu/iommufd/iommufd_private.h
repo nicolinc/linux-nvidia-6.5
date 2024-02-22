@@ -410,6 +410,7 @@ iommufd_get_device(struct iommufd_ucmd *ucmd, u32 id)
 void iommufd_device_destroy(struct iommufd_object *obj);
 int iommufd_device_invalidate(struct iommufd_ucmd *ucmd);
 int iommufd_device_set_virtual_id(struct iommufd_ucmd *ucmd);
+int iommufd_viommu_set_data(struct iommufd_ucmd *ucmd);
 int iommufd_get_hw_info(struct iommufd_ucmd *ucmd);
 
 struct iommufd_access {
