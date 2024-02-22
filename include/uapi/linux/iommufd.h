@@ -53,6 +53,7 @@ enum {
 	IOMMUFD_CMD_DEV_INVALIDATE,
 	IOMMUFD_CMD_VIOMMU_ALLOC,
 	IOMMUFD_CMD_DEV_SET_VIRTUAL_ID,
+	IOMMUFD_CMD_VIOMMU_SET_DATA,
 };
 
 /**
@@ -850,4 +851,31 @@ struct iommu_dev_set_virtual_id {
 	__aligned_u64 id;
 };
 #define IOMMU_DEV_SET_VIRTUAL_ID _IO(IOMMUFD_TYPE, IOMMUFD_CMD_DEV_SET_VIRTUAL_ID)
+
+/**
+ * enum iommu_viommu_data_type - VIOMMU Data Type
+ * @IOMMU_VIOMMU_DATA_TEGRA241_VCMDQ: NVIDIA Tegra241 VCMDQ Extension for SMMUv3
+ */
+enum iommu_viommu_data_type {
+	IOMMU_VIOMMU_DATA_TEGRA241_VCMDQ,
+};
+
+struct iommu_viommu_tegra241_vcmdq {
+	__u32 vcmdq_id;
+	__u32 vcmdq_log2size;
+	__aligned_u64 vcmdq_base;
+	__aligned_u64 cons_idx_base;
+};
+
+struct iommu_viommu_set_data {
+	__u32 size;
+	__u32 flags;
+	__u32 viommu_id;
+	__u32 __reserved;
+	__u32 data_type;
+	__u32 data_len;
+	__aligned_u64 data_uptr;
+};
+#define IOMMU_VIOMMU_SET_DATA _IO(IOMMUFD_TYPE, IOMMUFD_CMD_VIOMMU_SET_DATA)
+
 #endif

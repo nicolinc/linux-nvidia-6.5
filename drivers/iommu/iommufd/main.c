@@ -328,6 +328,7 @@ union ucmd_buffer {
 	struct iommu_ioas_alloc alloc;
 	struct iommu_ioas_allow_iovas allow_iovas;
 	struct iommu_viommu_alloc viommu;
+	struct iommu_viommu_set_data viommu_set_data;
 	struct iommu_ioas_copy ioas_copy;
 	struct iommu_ioas_iova_ranges iova_ranges;
 	struct iommu_ioas_map map;
@@ -389,6 +390,8 @@ static const struct iommufd_ioctl_op iommufd_ioctl_ops[] = {
 		 struct iommu_viommu_alloc, out_viommu_id),
 	IOCTL_OP(IOMMU_DEV_SET_VIRTUAL_ID, iommufd_device_set_virtual_id,
 		 struct iommu_dev_set_virtual_id, id),
+	IOCTL_OP(IOMMU_VIOMMU_SET_DATA, iommufd_viommu_set_data,
+		 struct iommu_viommu_set_data, data_uptr),
 #ifdef CONFIG_IOMMUFD_TEST
 	IOCTL_OP(IOMMU_TEST_CMD, iommufd_test, struct iommu_test_cmd, last),
 #endif
