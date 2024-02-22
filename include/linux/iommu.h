@@ -594,6 +594,8 @@ struct iommu_ops {
 	/* User space instance allocation and freeing by the iommu driver */
 	struct iommufd_viommu *(*viommu_alloc)(struct device *dev,
 					       struct iommu_domain *domain);
+	int (*viommu_set_data)(struct iommufd_viommu *viommu,
+			       const struct iommu_user_data *user_data);
 	void (*viommu_free)(struct iommufd_viommu *viommu);
 	int (*viommu_set_dev_id)(struct iommufd_viommu *viommu,
 				 struct device *dev, u64 dev_id);
