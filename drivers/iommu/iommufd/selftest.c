@@ -518,7 +518,8 @@ struct mock_viommu {
 	struct xarray ids;
 };
 
-static struct iommufd_viommu *mock_viommu_alloc(struct device *dev)
+static struct iommufd_viommu *mock_viommu_alloc(struct device *dev,
+						struct iommu_domain *domain)
 {
 	struct mock_viommu *mv;
 
