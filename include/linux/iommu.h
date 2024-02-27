@@ -494,6 +494,7 @@ struct iommu_ops {
 					       struct iommu_domain *domain);
 	int (*viommu_set_data)(struct iommufd_viommu *viommu,
 			       const struct iommu_user_data *user_data);
+	int (*viommu_reset)(struct iommufd_viommu *viommu);
 	void (*viommu_free)(struct iommufd_viommu *viommu);
 	int (*viommu_set_dev_id)(struct iommufd_viommu *viommu,
 				 struct device *dev, u64 dev_id);

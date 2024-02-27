@@ -54,6 +54,7 @@ enum {
 	IOMMUFD_CMD_VIOMMU_ALLOC,
 	IOMMUFD_CMD_DEV_SET_VIRTUAL_ID,
 	IOMMUFD_CMD_VIOMMU_SET_DATA,
+	IOMMUFD_CMD_VIOMMU_RESET,
 };
 
 /**
@@ -877,5 +878,13 @@ struct iommu_viommu_set_data {
 	__aligned_u64 data_uptr;
 };
 #define IOMMU_VIOMMU_SET_DATA _IO(IOMMUFD_TYPE, IOMMUFD_CMD_VIOMMU_SET_DATA)
+
+struct iommu_viommu_reset {
+	__u32 size;
+	__u32 flags;
+	__u32 viommu_id;
+	__u32 __reserved;
+};
+#define IOMMU_VIOMMU_RESET _IO(IOMMUFD_TYPE, IOMMUFD_CMD_VIOMMU_RESET)
 
 #endif
