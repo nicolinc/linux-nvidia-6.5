@@ -2824,8 +2824,6 @@ int arm_smmu_set_pasid(struct arm_smmu_master *master,
 {
 	struct iommu_domain *sid_domain = iommu_get_domain_for_dev(master->dev);
 	struct attach_state state = {
-		.old_domain =
-			iommu_get_domain_for_dev_pasid(master->dev, pasid, 0),
 		.ssid = pasid,
 	};
 	struct arm_smmu_cd *cdptr;
